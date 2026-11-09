@@ -19,10 +19,12 @@ from PIL import Image
 
 # moviepy v2 / v1 compatibility
 try:
-    from moviepy import VideoClip, AudioFileClip, concatenate_videoclips
+    from moviepy import (VideoClip, AudioFileClip, VideoFileClip, ColorClip,
+                         CompositeVideoClip, concatenate_videoclips)
     MP_V2 = True
 except ImportError:
-    from moviepy.editor import VideoClip, AudioFileClip, concatenate_videoclips
+    from moviepy.editor import (VideoClip, AudioFileClip, VideoFileClip, ColorClip,
+                                CompositeVideoClip, concatenate_videoclips)
     MP_V2 = False
 
 W, H = 1280, 720
@@ -62,6 +64,8 @@ PRESETS = {  # pitch offset in Hz
     "Woman": 10,
     "Very old man (deep)": -30,
 }
+
+LIPSYNC_SPACE = "pragnakalp/Wav2lip-ZeroGPU"  # free public Hugging Face Space
 
 MOTIONS = ["Zoom in", "Zoom out", "Pan left", "Pan right"]
 
@@ -175,21 +179,68 @@ def motion_clip(img_bytes: bytes, motion: str, duration: float):
     return VideoClip(frame, duration=duration)
 
 
-def render(scenes, voice, pitch, rate, progress):
+def lipsync_clip(img_bytes, audio_path, tmp, i, hf_token):
+    """Talking-face clip: image + voice -> video where the mouth moves (Wav2Lip Space)."""
+    from gradio_client import Client, handle_file
+
+    img_path = os.path.join(tmp, f"face_{i}.png")
+    with open(img_path, "wb") as f:
+        f.write(to_png_bytes(Image.open(io.BytesIO(img_bytes))))
+
+    wav_path = os.path.join(tmp, f"voice_{i}.wav")
+    a = AudioFileClip(audio_path)
+    a.write_audiofile(wav_path, logger=None)
+
+    try:
+        client = Client(LIPSYNC_SPACE, hf_token=hf_token or None)
+    except TypeError:
+        client = Client(LIPSYNC_SPACE, token=hf_token or None)
+    result = client.predict(
+        input_image=handle_file(img_path),
+        input_audio=handle_file(wav_path),
+        api_name="/run_infrence",
+    )
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+    if isinstance(result, dict):
+        result = result.get("video") or result.get("path")
+
+    talk = VideoFileClip(result)
+    talk = talk.resized(height=H) if MP_V2 else talk.resize(height=H)
+    if talk.w > W:
+        talk = talk.resized(width=W) if MP_V2 else talk.resize(width=W)
+    bg = ColorClip((W, H), color=(0, 0, 0))
+    bg = bg.with_duration(talk.duration) if MP_V2 else bg.set_duration(talk.duration)
+    talk = talk.with_position("center") if MP_V2 else talk.set_position("center")
+    comp = CompositeVideoClip([bg, talk], size=(W, H))
+    audio = AudioFileClip(audio_path)
+    return comp.with_audio(audio) if MP_V2 else comp.set_audio(audio)
+
+
+def render(scenes, progress, hf_token, warn):
     tmp = tempfile.mkdtemp()
     clips = []
     for i, sc in enumerate(scenes):
         progress.progress(i / len(scenes), f"Scene {i + 1} of {len(scenes)}")
         audio = None
+        apath = None
         duration = float(sc["sec"])
         if sc["text"].strip():
             apath = os.path.join(tmp, f"voice_{i}.mp3")
-            make_speech(sc["text"], voice, pitch, rate, apath)
+            make_speech(sc["text"], VOICES[sc["voice"]], sc["pitch"], sc["rate"], apath)
             audio = AudioFileClip(apath)
             duration = max(duration, audio.duration + 0.3)
-        clip = motion_clip(sc["image"], sc["motion"], duration)
-        if audio is not None:
-            clip = clip.with_audio(audio) if MP_V2 else clip.set_audio(audio)
+
+        clip = None
+        if sc["lipsync"] and apath:
+            try:
+                clip = lipsync_clip(sc["image"], apath, tmp, i, hf_token)
+            except Exception as e:
+                warn(f"Scene {i + 1}: lip-sync failed ({str(e)[:150]}). Used normal motion instead.")
+        if clip is None:
+            clip = motion_clip(sc["image"], sc["motion"], duration)
+            if audio is not None:
+                clip = clip.with_audio(audio) if MP_V2 else clip.set_audio(audio)
         clips.append(clip)
 
     final = concatenate_videoclips(clips, method="compose")
@@ -265,20 +316,28 @@ if ss.cur_img:
 st.header("3. Add to storyboard")
 motion = st.selectbox("Camera motion", MOTIONS)
 sec = st.number_input("Minimum seconds", 1, 30, 4)
-narration = st.text_area("Narration for this scene (optional)", height=80)
+narration = st.text_area("What this character says (optional)", height=80)
+sc_voice = st.selectbox("Speaker voice for this scene", list(VOICES.keys()),
+                        index=list(VOICES.keys()).index(voice_name))
+st.caption(f"This scene will use pitch {ss.pitch:+d} Hz and the speed set above. "
+           "Change them before adding the next scene to make a different character.")
+lipsync = st.checkbox("👄 Make the mouth move (needs a clear front-facing face)", value=True)
 
 if st.button("➕ Add scene", type="primary", use_container_width=True):
     if not ss.cur_img:
         st.warning("Make or upload an image first.")
     else:
-        ss.scenes.append({"image": ss.cur_img, "motion": motion,
-                          "sec": int(sec), "text": narration})
+        ss.scenes.append({"image": ss.cur_img, "motion": motion, "sec": int(sec),
+                          "text": narration, "voice": sc_voice, "pitch": ss.pitch,
+                          "rate": rate, "lipsync": lipsync})
         st.rerun()
 
 for i, sc in enumerate(ss.scenes):
     with st.container(border=True):
         st.image(sc["image"], width=200)
-        st.caption(f"{sc['motion']} · {sc['sec']}s · {sc['text'] or 'no narration'}")
+        st.caption(f"{sc['voice']} · {sc['pitch']:+d}Hz · "
+                   f"{'talking face' if sc['lipsync'] and sc['text'] else sc['motion']} · "
+                   f"{sc['text'] or 'no speech'}")
         a, b, c = st.columns(3)
         if a.button("⬆️", key=f"up{i}") and i > 0:
             ss.scenes[i - 1], ss.scenes[i] = ss.scenes[i], ss.scenes[i - 1]
@@ -292,16 +351,17 @@ for i, sc in enumerate(ss.scenes):
 
 # ===================== UI: RENDER =====================
 st.header("4. Make video")
+hf_tok = st.text_input("Hugging Face token (optional, gives more free lip-sync quota)", type="password")
 if st.button("🎬 Make video", type="primary", use_container_width=True,
              disabled=not ss.scenes):
     bar = st.progress(0.0, "Starting...")
     try:
-        ss.video = render(ss.scenes, voice, ss.pitch, rate, bar)
+        ss.video = render(ss.scenes, bar, hf_tok.strip(), st.warning)
     except Exception as e:
         st.error(f"Render failed: {e}")
 
 if ss.video:
     st.video(ss.video)
-    st.caption("Voice too high or low? Use the pitch buttons at the top, then make the video again.")
+    st.caption("Voice too high or low? Delete that scene, fix the pitch at the top, and add it again.")
     st.download_button("⬇️ Download MP4", ss.video, file_name="cinegen_video.mp4",
-                       mime="video/mp4", use_container_width=True)
+                   mime="video/mp4", use_container_width=True)
