@@ -5,3 +5,4 @@ pillow
 numpy
 requests
 imageio-ffmpeg
+gradio_client
